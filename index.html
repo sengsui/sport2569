@@ -1,0 +1,1258 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ระบบรายงานผลการแข่งขันกีฬาสีภายใน</title>
+  <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  
+  <style>
+    body { font-family: 'Sarabun', sans-serif; background-color: #f8fafc; }
+    .pulse-badge { animation: pulse 1.5s infinite; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(1.05); }
+    }
+    @media print {
+      body * { display: none !important; }
+      #print-area, #print-area * { display: block !important; }
+      #print-area { position: absolute; left: 0; top: 0; width: 100%; }
+    }
+  </style>
+</head>
+<body class="flex flex-col min-h-screen">
+
+  <div id="loading" class="fixed inset-0 bg-slate-900/60 z-50 flex flex-col items-center justify-center text-white hidden">
+    <div class="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-blue-500 mb-4"></div>
+    <p class="text-lg font-medium">กำลังประมวลผลข้อมูล...</p>
+  </div>
+
+  <div id="toast-container" class="fixed top-5 right-5 z-50 flex flex-col gap-2"></div>
+
+  <nav class="bg-blue-700 text-white shadow-md sticky top-0 z-40">
+    <div class="max-w-7xl mx-auto px-4">
+      <div class="flex justify-between h-16 items-center">
+        <div class="flex items-center space-x-3">
+          <i class="fa-solid font-bold fa-trophy text-2xl text-yellow-300"></i>
+          <div>
+            <span class="font-bold text-lg block leading-tight" id="nav-school">โรงเรียน</span>
+            <span class="text-xs text-blue-200" id="nav-event">กีฬาสี</span>
+          </div>
+        </div>
+        <div class="hidden md:flex space-x-1 font-medium" id="nav-links">
+          </div>
+        <div class="md:hidden">
+          <button id="btn-menu" class="p-2 text-xl focus:outline-none"><i class="fa-solid fa-bars"></i></button>
+        </div>
+      </div>
+    </div>
+    <div id="mobile-menu" class="hidden md:hidden bg-blue-800 border-t border-blue-600 px-4 py-2 space-y-1"></div>
+  </nav>
+
+  <main id="app" class="flex-grow max-w-7xl w-100 mx-auto px-4 py-6 w-full"></main>
+
+  <div id="print-area" class="hidden"></div>
+
+  <footer class="bg-slate-800 text-slate-400 text-center py-4 border-t border-slate-700 text-sm">
+    <p>© <span id="footer-year">2026</span> <span id="footer-school"></span> System Powered by Google Sheets & Apps Script</p>
+  </footer>
+
+  <div id="modal-container" class="fixed inset-0 bg-slate-900/50 z-50 flex items-center justify-center p-4 hidden">
+    <div class="bg-white rounded-xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto" id="modal-content"></div>
+  </div>
+
+  <script>
+    const CONFIG = {
+      API_URL: "https://script.google.com/macros/s/AKfycbyGxicn-OxeoqmP-oXQYwEPaMKw1Gyw0iTgOFiqrx5XRI6vh1RiSfDd7Hag9RK35X_E/exec", // 🔴 นำลิงก์ Web App จาก Google Apps Script มาใส่ตรงนี้
+      SCHOOL_NAME: "โรงเรียนวิทยาการเทคโนโลยี",
+      EVENT_NAME: "มหกรรมกีฬาสีเบญจมิตรเกมส์",
+      EVENT_DATE: "2026-11-20T08:00:00",
+      MEDAL_SCORE: { gold: 3, silver: 2, bronze: 1 }
+    };
+
+    // State Application Centralized Cache
+    let State = {
+      currentView: '#home',
+      teams: [],
+      sports: [],
+      schedules: [],
+      user: JSON.parse(sessionStorage.getItem('user')) || null,
+      refreshInterval: null
+    };
+
+    // Initialization App
+    window.addEventListener('DOMContentLoaded', async () => {
+      document.getElementById('nav-school').innerText = CONFIG.SCHOOL_NAME;
+      document.getElementById('nav-event').innerText = CONFIG.EVENT_NAME;
+      document.getElementById('footer-school').innerText = CONFIG.SCHOOL_NAME;
+      document.getElementById('footer-year').innerText = new Date().getFullYear();
+      
+      setupNavbar();
+      
+      // ดึงข้อมูลพื้นฐานที่จำเป็นก่อนเริ่มเรนเดอร์
+      await loadInitialData();
+      
+      // แฮนเดิล Router เคลื่อนไหวหน้าเพจ
+      window.addEventListener('hashchange', router);
+      router();
+    });
+
+    function setupNavbar() {
+      const publicLinks = [
+        { hash: '#home', label: 'หน้าแรก', icon: 'fa-house' },
+        { hash: '#schedule', label: 'ตารางแข่ง', icon: 'fa-calendar-days' },
+        { hash: '#sports', label: 'ประเภทกีฬา', icon: 'fa-basketball' },
+        { hash: '#scoreboard', label: 'ตารางคะแนน', icon: 'fa-square-poll-vertical' }
+      ];
+
+      let linksHtml = publicLinks.map(l => `<a href="${l.hash}" class="px-3 py-2 rounded-lg hover:bg-blue-600 transition"><i class="fa-solid ${l.icon} mr-1"></i>${l.label}</a>`).join('');
+      
+      if (State.user) {
+        linksHtml += `
+          <a href="#admin" class="px-3 py-2 bg-yellow-500 hover:bg-yellow-600 text-slate-900 rounded-lg font-bold transition"><i class="fa-solid fa-lock mr-1"></i>ระบบหลังบ้าน</a>
+          <button onclick="authLogout()" class="px-3 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg transition"><i class="fa-solid fa-right-from-bracket"></i></button>
+        `;
+      } else {
+        linksHtml += `<a href="#login" class="px-3 py-2 bg-blue-900 hover:bg-blue-950 text-white rounded-lg transition"><i class="fa-solid fa-user-lock"></i> เข้าสู่ระบบ</a>`;
+      }
+
+      document.getElementById('nav-links').innerHTML = linksHtml;
+      document.getElementById('mobile-menu').innerHTML = linksHtml;
+
+      document.getElementById('btn-menu').onclick = () => {
+        document.getElementById('mobile-menu').classList.toggle('hidden');
+      };
+    }
+
+    async function loadInitialData() {
+      showLoading(true);
+      try {
+        const [teamsRes, sportsRes] = await Promise.all([
+          fetchApi('getTeams'),
+          fetchApi('getSports')
+        ]);
+        State.teams = teamsRes || [];
+        State.sports = sportsRes || [];
+      } catch (e) {
+        showToast('ไม่สามารถดึงข้อมูลพื้นฐานได้', 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    // Router System
+    function router() {
+      if(State.refreshInterval) clearInterval(State.refreshInterval);
+      const hash = window.location.hash || '#home';
+      State.currentView = hash;
+      
+      // ปิดเมนูมือถือเวลาเปลี่ยนหน้า
+      document.getElementById('mobile-menu').classList.add('hidden');
+
+      // ตรวจสอบความปลอดภัยกรณีเข้าหน้าแอดมินแต่ยังไม่ล็อกอิน
+      if (hash.startsWith('#admin') && !State.user) {
+        window.location.hash = '#login';
+        return;
+      }
+
+      const app = document.getElementById('app');
+      
+      switch (hash) {
+        case '#home': renderHome(app); break;
+        case '#schedule': renderSchedule(app); break;
+        case '#sports': renderSports(app); break;
+        case '#scoreboard': renderScoreboard(app); break;
+        case '#login': renderLogin(app); break;
+        case '#admin': renderAdminDashboard(app); break;
+        case '#admin-sports': renderAdminSports(app); break;
+        case '#admin-teams': renderAdminTeams(app); break;
+        case '#admin-results': renderAdminResults(app); break;
+        case '#admin-schedule': renderAdminSchedule(app); break;
+        case '#admin-import': renderAdminImport(app); break;
+        case '#admin-download': renderAdminDownload(app); break;
+        case '#admin-certificate': renderAdminCertificate(app); break;
+        default: app.innerHTML = `<h1 class="text-2xl font-bold">404 - ไม่พบหน้านี้</h1>`;
+      }
+    }
+
+    // --- API CORE COMMUNICATIONS ---
+    async function fetchApi(action, params = {}) {
+      const url = new URL(CONFIG.API_URL);
+      url.searchParams.append('action', action);
+      Object.keys(params).forEach(key => url.searchParams.append(key, params[key]));
+      const response = await fetch(url);
+      const json = await response.json();
+      return json.data;
+    }
+
+    async function postApi(action, data = {}) {
+      showLoading(true);
+      try {
+        const payload = {
+          action: action,
+          token: State.user?.token,
+          username: State.user?.username,
+          ...data
+        };
+        const response = await fetch(CONFIG.API_URL, {
+          method: 'POST',
+          body: JSON.stringify(payload)
+        });
+        const json = await response.json();
+        if (json.status !== 200) throw new Error(json.data?.error || 'เกิดข้อผิดพลาด');
+        return json.data;
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    // --- SHA-256 Hashing Encryption ---
+    async function sha256(message) {
+      const msgBuffer = new TextEncoder().encode(message);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // --- UI HELPERS ---
+    function showLoading(show) {
+      document.getElementById('loading').classList.toggle('hidden', !show);
+    }
+
+    function showToast(message, type = 'success') {
+      const container = document.getElementById('toast-container');
+      const bg = type === 'success' ? 'bg-emerald-600' : 'bg-rose-600';
+      const toast = document.createElement('div');
+      toast.className = `${bg} text-white px-4 py-3 rounded-lg shadow-lg flex items-center space-x-2 transition-all duration-300 transform translate-y-2`;
+      toast.innerHTML = `<i class="fa-solid ${type === 'success' ? 'fa-circle-check' : 'fa-circle-exclamation'}"></i><span>${message}</span>`;
+      container.appendChild(toast);
+      setTimeout(() => { toast.classList.remove('translate-y-2'); toast.classList.add('opacity-0'); setTimeout(() => toast.remove(), 300); }, 3000);
+    }
+
+    function openModal(html) {
+      document.getElementById('modal-content').innerHTML = html;
+      document.getElementById('modal-container').classList.remove('hidden');
+    }
+
+    function closeModal() {
+      document.getElementById('modal-container').classList.add('hidden');
+    }
+
+    // ==================== VIEW RENDERERS (13 หน้าหลัก) ====================
+
+    // หน้าที่ 1: หน้าหลัก / แดชบอร์ด (#home)
+    async function renderHome(target) {
+      target.innerHTML = `<div class="text-center py-20 text-slate-500 animate-pulse"><i class="fa-solid fa-spinner text-4xl mb-2"></i><p>กำลังโหลดหน้าแดชบอร์ด...</p></div>`;
+      
+      const dashData = await fetchApi('getDashboard');
+      
+      let teamsCards = dashData.medalSummary.map((t, idx) => `
+        <div class="rounded-xl shadow-md p-5 border text-white transition transform hover:-translate-y-1" style="background-color: ${t.color}; color: ${t.text_color || '#FFF'}">
+          <div class="flex justify-between items-center mb-4">
+            <h3 class="text-2xl font-bold">${t.name}</h3>
+            <img src="${t.logo || 'https://placehold.co/50'}" class="w-12 h-12 object-contain rounded-full bg-white/80 p-1">
+          </div>
+          <div class="grid grid-cols-4 gap-2 text-center text-slate-900 font-bold bg-white/90 p-3 rounded-lg shadow-inner">
+            <div class="text-yellow-600"><span class="block text-xs">ทอง</span><span class="text-lg">${t.gold}</span></div>
+            <div class="text-slate-500"><span class="block text-xs">เงิน</span><span class="text-lg">${t.silver}</span></div>
+            <div class="text-amber-700"><span class="block text-xs">ทองแดง</span><span class="text-lg">${t.bronze}</span></div>
+            <div class="text-blue-700 border-l border-slate-300"><span class="block text-xs">รวม</span><span class="text-lg">${t.score}</span></div>
+          </div>
+          <div class="text-center mt-3 font-semibold text-sm drop-shadow-md">อันดับที่ ${idx+1} ของโรงเรียน</div>
+        </div>
+      `).join('');
+
+      target.innerHTML = `
+        <div class="bg-gradient-to-r from-blue-600 to-indigo-800 text-white rounded-2xl p-6 md:p-10 shadow-lg text-center relative overflow-hidden mb-8">
+          <h2 class="text-3xl md:text-5xl font-bold mb-2 drop-shadow-md">${CONFIG.EVENT_NAME}</h2>
+          <p class="text-lg text-indigo-100">${CONFIG.SCHOOL_NAME}</p>
+          <div id="countdown" class="mt-6 flex justify-center space-x-3 text-slate-900">
+            </div>
+        </div>
+
+        <h2 class="text-2xl font-bold mb-4 text-slate-800"><i class="fa-solid fa-square-poll-vertical text-blue-600 mr-2"></i>อันดับและคะแนนรวมคณะสี</h2>
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">${teamsCards}</div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          <div class="lg:col-span-1 bg-white p-5 rounded-xl shadow-md border">
+            <h3 class="text-lg font-bold mb-4 border-b pb-2 text-slate-700"><i class="fa-solid fa-ranking-star text-amber-500 mr-2"></i>ตารางอันดับสะสม</h3>
+            <table class="w-full text-left">
+              <thead>
+                <tr class="text-slate-400 text-xs uppercase border-b">
+                  <th class="py-2">คณะสี</th>
+                  <th class="py-2 text-center">เหรียญ</th>
+                  <th class="py-2 text-right">คะแนน</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${dashData.medalSummary.map((t, idx) => `
+                  <tr class="border-b text-sm">
+                    <td class="py-3 flex items-center space-x-2">
+                      <span class="w-5 h-5 rounded-full inline-block border" style="background-color: ${t.color}"></span>
+                      <span class="font-medium">${t.name}</span>
+                    </td>
+                    <td class="text-center">${t.gold}🥇 ${t.silver}🥈 ${t.bronze}🥉</td>
+                    <td class="text-right font-bold text-blue-600">${t.score}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+
+          <div class="lg:col-span-2 bg-white p-5 rounded-xl shadow-md border">
+            <h3 class="text-lg font-bold mb-4 border-b pb-2 text-slate-700"><i class="fa-solid fa-circle-check text-emerald-500 mr-2"></i>ผลการแข่งขันล่าสุด</h3>
+            <div class="space-y-3">
+              ${dashData.latestResults.length === 0 ? '<p class="text-slate-400 text-center py-6">ยังไม่มีการบันทึกผลการแข่งขัน</p>' : dashData.latestResults.map(r => {
+                const team = State.teams.find(t => t.id == r.id_คณะสี);
+                return `
+                  <div class="flex items-center justify-between p-3 bg-slate-50 rounded-lg border border-l-4" style="border-left-color: ${team?.color || '#ccc'}">
+                    <div>
+                      <span class="font-bold text-slate-700">อันดับที่ ${r.อันดับ} (${r.ประเภทเหรียญ}🥇)</span>
+                      <p class="text-xs text-slate-400">ค่าสถิติ: ${r.ค่า || '-'} | บันทึกเมื่อ: ${new Date(r.บันทึกเมื่อ).toLocaleTimeString('th-TH')}</p>
+                    </div>
+                    <span class="px-2 py-1 text-xs rounded font-bold" style="background-color: ${team?.color}; color: ${team?.text_color}">${team?.ชื่อคณะ}</span>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          </div>
+        </div>
+      `;
+
+      // Start Countdown Timer function
+      initCountdown();
+
+      // Auto Refresh Every 60s
+      State.refreshInterval = setInterval(async () => {
+        showToast('กำลังอัปเดตข้อมูลอัตโนมัติ...', 'success');
+        renderHome(target);
+      }, 60000);
+    }
+
+    function initCountdown() {
+      const clock = document.getElementById('countdown');
+      const targetDate = new Date(CONFIG.EVENT_DATE).getTime();
+
+      function updateClock() {
+        const now = new Date().getTime();
+        const diff = targetDate - now;
+        if(diff < 0) { clock.innerHTML = `<span class="bg-emerald-500 text-white font-bold px-6 py-2 rounded-lg text-lg animate-pulse">🎉 การแข่งขันเริ่มต้นขึ้นแล้ว! 🎉</span>`; return; }
+
+        const d = Math.floor(diff / (1000 * 60 * 60 * 24));
+        const h = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+        const m = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+        const s = Math.floor((diff % (1000 * 60)) / 1000);
+
+        clock.innerHTML = `
+          <div class="bg-white p-3 rounded-lg shadow text-center min-w-[60px]"><span class="block text-2xl font-bold">${d}</span><span class="text-xs text-slate-400">วัน</span></div>
+          <div class="bg-white p-3 rounded-lg shadow text-center min-w-[60px]"><span class="block text-2xl font-bold">${h}</span><span class="text-xs text-slate-400">ชม.</span></div>
+          <div class="bg-white p-3 rounded-lg shadow text-center min-w-[60px]"><span class="block text-2xl font-bold">${m}</span><span class="text-xs text-slate-400">นาที</span></div>
+          <div class="bg-white p-3 rounded-lg shadow text-center min-w-[60px]"><span class="block text-2xl font-bold">${s}</span><span class="text-xs text-slate-400">วิ</span></div>
+        `;
+      }
+      updateClock();
+      setInterval(updateClock, 1000);
+    }
+
+    // หน้าที่ 2: ตารางการแข่งขัน (#schedule)
+    async function renderSchedule(target) {
+      showLoading(true);
+      const list = await fetchApi('getSchedule');
+      showLoading(false);
+
+      target.innerHTML = `
+        <div class="bg-white p-6 rounded-xl shadow-md border mb-6">
+          <h2 class="text-xl font-bold text-slate-800 mb-4"><i class="fa-solid fa-calendar text-blue-600 mr-2"></i>ตารางการแข่งขันและสถานะเรียลไทม์</h2>
+          
+          <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
+            <input type="date" id="filter-date" class="border p-2 rounded-lg text-sm" placeholder="กรองด้วยวันที่">
+            <select id="filter-sport" class="border p-2 rounded-lg text-sm">
+              <option value="">-- กีฬทั้งหมด --</option>
+              ${State.sports.map(s => `<option value="${s.id}">${s.ชื่อกีฬา}</option>`).join('')}
+            </select>
+            <select id="filter-status" class="border p-2 rounded-lg text-sm">
+              <option value="">-- สถานะทั้งหมด --</option>
+              <option value="รอ">รอการแข่งขัน</option>
+              <option value="กำลังแข่ง">กำลังแข่งขัน</option>
+              <option value="จบ">แข่งขันสิ้นสุด</option>
+            </select>
+            <button onclick="applyScheduleFilters()" class="bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium py-2"><i class="fa-solid fa-filter mr-1"></i> กรองข้อมูล</button>
+          </div>
+
+          <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse" id="schedule-table">
+              <thead>
+                <tr class="bg-slate-100 text-slate-600 text-sm border-b">
+                  <th class="p-3">วัน/เวลา</th>
+                  <th class="p-3">ประเภทกีฬา</th>
+                  <th class="p-3">สถานที่</th>
+                  <th class="p-3 text-center">สถานะ</th>
+                  <th class="p-3 text-center">รายละเอียด</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${renderScheduleRows(list)}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderScheduleRows(list) {
+      if(list.length === 0) return `<tr><td colspan="5" class="text-center py-6 text-slate-400">ไม่พบตารางการแข่งขันที่ตรงกับเงื่อนไข</td></tr>`;
+      return list.map(s => {
+        const sport = State.sports.find(sp => sp.id == s.id_กีฬา);
+        let badgeColor = "bg-slate-200 text-slate-700";
+        let pulseClass = "";
+        if (s.status === 'กำลังแข่ง') { badgeColor = "bg-amber-500 text-white"; pulseClass="pulse-badge"; }
+        else if (s.status === 'จบ') badgeColor = "bg-emerald-600 text-white";
+        else if (s.status === 'เลื่อน') badgeColor = "bg-rose-500 text-white";
+
+        return `
+          <tr class="border-b text-sm hover:bg-slate-50 transition cursor-pointer" onclick="viewScheduleDetail(${s.id})">
+            <td class="p-3 font-medium">${s.วันที่} <br><span class="text-xs text-slate-400">${s.เวลาเริ่ม} - ${s.เวลาสิ้นสุด} น.</span></td>
+            <td class="p-3"><span class="font-bold text-blue-700">${sport?.ชื่อกีฬา || 'ไม่ทราบกีฬา'}</span><br><span class="text-xs text-slate-400">${sport?.ประเภท} | ${sport?.ช่วงชั้น}</span></td>
+            <td class="p-3 text-slate-600">${s.สถานที่}</td>
+            <td class="p-3 text-center"><span class="px-2 py-1 rounded-full text-xs font-bold ${badgeColor} ${pulseClass}">${s.สถานะ}</span></td>
+            <td class="p-3 text-center text-blue-600"><i class="fa-solid fa-circle-info text-lg"></i></td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    async function viewScheduleDetail(id) {
+      showLoading(true);
+      const results = await fetchApi('getResults', { schedule_id: id });
+      showLoading(false);
+      
+      let html = `
+        <div class="p-6">
+          <div class="flex justify-between items-center border-b pb-3 mb-4">
+            <h3 class="text-xl font-bold text-slate-800">รายละเอียดและสรุปผลการแข่งขัน</h3>
+            <button onclick="closeModal()" class="text-slate-400 hover:text-slate-600"><i class="fa-solid fa-xmark text-xl"></i></button>
+          </div>
+          <div class="bg-slate-50 p-4 rounded-lg mb-4 text-sm space-y-1">
+            <p><strong>รหัสรายการ:</strong> #${id}</p>
+            <p><strong>บันทึกเพิ่มเติม:</strong> ${results[0]?.บันทึกโดย ? 'ลงผลแล้วโดย ' + results[0].บันทึกโดย : 'ยังไม่มีการสรุปผลอย่างเป็นทางการ'}</p>
+          </div>
+          <h4 class="font-bold text-slate-700 mb-2">ทำเนียบผู้ชนะรายการนี้</h4>
+          <div class="space-y-2">
+            ${results.length === 0 ? '<p class="text-slate-400 text-center py-4">รายการนี้อยู่ระหว่างดำเนินการ หรือยังไม่มีผลการแข่ง</p>' : results.map(r => {
+              const team = State.teams.find(t => t.id == r.id_คณะสี);
+              return `
+                <div class="flex items-center justify-between p-3 border rounded-lg bg-white" style="border-left: 5px solid ${team?.color}">
+                  <div><span class="text-lg font-bold mr-2">อันดับที่ ${r.อันดับ}</span> (${r.ประเภทเหรียญ}🥇)</div>
+                  <span class="px-3 py-1 rounded text-xs font-bold" style="background-color: ${team?.color}; color: ${team?.text_color}">${team?.ชื่อคณะ}</span>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        </div>
+      `;
+      openModal(html);
+    }
+
+    // หน้าที่ 3: ประเภทกีฬา (#sports)
+    function renderSports(target) {
+      target.innerHTML = `
+        <h2 class="text-2xl font-bold mb-6 text-slate-800"><i class="fa-solid fa-basketball text-orange-500 mr-2"></i>ประเภทกีฬาที่เปิดแข่งขัน</h2>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+          ${State.sports.map(s => `
+            <div class="bg-white rounded-xl shadow-md overflow-hidden border hover:shadow-lg transition flex flex-col justify-between">
+              <div class="p-5">
+                <div class="flex items-center space-x-3 mb-3">
+                  <div class="w-12 h-12 bg-blue-100 rounded-lg flex items-center justify-center text-blue-600 text-xl font-bold">
+                    <i class="fa-solid fa-medal"></i>
+                  </div>
+                  <div>
+                    <h3 class="font-bold text-lg text-slate-800">${s.ชื่อกีฬา}</h3>
+                    <span class="text-xs bg-slate-100 px-2 py-0.5 rounded text-slate-500">${s.ประเภท}</span>
+                  </div>
+                </div>
+                <div class="text-sm text-slate-600 space-y-1">
+                  <p><strong>เพศ:</strong> ${s.เพศ}</p>
+                  <p><strong>ช่วงชั้น:</strong> ${s.ช่วงชั้น}</p>
+                  <p><strong>จำนวนผู้แข่งขัน/ทีม:</strong> ${s.จำนวนผู้แข่ง} คน</p>
+                </div>
+              </div>
+              <div class="bg-slate-50 p-3 border-t text-center">
+                <button onclick="viewSportDetails(${s.id})" class="text-blue-600 hover:text-blue-800 font-semibold text-sm">ดูรายชื่อนักกีฬาและผลแข่งขัน</button>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    async function viewSportDetails(sportId) {
+      showLoading(true);
+      const athletes = await fetchApi('getAthletes', { sport_id: sportId });
+      showLoading(false);
+      const sport = State.sports.find(s => s.id == sportId);
+
+      let html = `
+        <div class="p-6">
+          <div class="flex justify-between items-center border-b pb-3 mb-4">
+            <h3 class="text-xl font-bold text-slate-800">รายชื่อนักกีฬา: ${sport?.ชื่อกีฬา}</h3>
+            <button onclick="closeModal()" class="text-slate-400 hover:text-slate-600"><i class="fa-solid fa-xmark text-xl"></i></button>
+          </div>
+          <div class="max-h-[50vh] overflow-y-auto">
+            <table class="w-full text-left text-sm border-collapse">
+              <thead>
+                <tr class="bg-slate-100 border-b">
+                  <th class="p-2">เลขประจำตัว</th>
+                  <th class="p-2">ชื่อ-นามสกุล</th>
+                  <th class="p-2">ชั้น/ห้อง</th>
+                  <th class="p-2">คณะสี</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${athletes.length === 0 ? '<tr><td colspan="4" class="text-center py-4 text-slate-400">ยังไม่มีการขึ้นทะเบียนนักกีฬาในหมวดนี้</td></tr>' : athletes.map(a => {
+                  const team = State.teams.find(t => t.id == a.id_คณะสี);
+                  return `
+                    <tr class="border-b">
+                      <td class="p-2 font-mono">${a.เลขประจำตัว}</td>
+                      <td class="p-2">${a.ชื่อ} ${a.นามสกุล}</td>
+                      <td class="p-2">${a['ชั้น/ห้อง']}</td>
+                      <td class="p-2"><span class="px-2 py-0.5 rounded text-xs font-bold text-white" style="background-color: ${team?.color}">${team?.ชื่อคณะ}</span></td>
+                    </tr>
+                  `;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `;
+      openModal(html);
+    }
+
+    // หน้าที่ 4: ตารางคะแนนสรุปเหรียญ (#scoreboard)
+    async function renderScoreboard(target) {
+      showLoading(true);
+      const summary = await fetchApi('getMedalSummary');
+      showLoading(false);
+
+      target.innerHTML = `
+        <h2 class="text-2xl font-bold mb-6 text-slate-800"><i class="fa-solid fa-square-poll-vertical text-blue-600 mr-2"></i>กระดานคะแนนและสถิติการรับเหรียญรางวัล</h2>
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8 mb-8">
+          <div class="lg:col-span-2 bg-white p-5 rounded-xl shadow-md border overflow-x-auto">
+            <table class="w-full text-left border-collapse">
+              <thead>
+                <tr class="bg-slate-50 border-b text-sm font-bold text-slate-600">
+                  <th class="p-3">คณะสี</th>
+                  <th class="p-3 text-center">🥇 ทอง</th>
+                  <th class="p-3 text-center">🥈 เงิน</th>
+                  <th class="p-3 text-center">🥉 ทองแดง</th>
+                  <th class="p-3 text-right">คะแนนรวม</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${summary.map(t => `
+                  <tr class="border-b hover:bg-slate-50">
+                    <td class="p-3 flex items-center space-x-3">
+                      <span class="w-4 h-4 rounded-full border" style="background-color:${t.color}"></span>
+                      <span class="font-bold text-slate-700">${t.name}</span>
+                    </td>
+                    <td class="p-3 text-center font-bold text-yellow-600 text-lg">${t.gold}</td>
+                    <td class="p-3 text-center font-bold text-slate-400 text-lg">${t.silver}</td>
+                    <td class="p-3 text-center font-bold text-amber-700 text-lg">${t.bronze}</td>
+                    <td class="p-3 text-right font-extrabold text-blue-600 text-lg">${t.score}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+          <div class="lg:col-span-1 bg-white p-5 rounded-xl shadow-md border flex items-center justify-center">
+            <canvas id="chart-medals" width="100" height="100"></canvas>
+          </div>
+        </div>
+      `;
+
+      // Render ChartJS Dynamic
+      const ctx = document.getElementById('chart-medals').getContext('2d');
+      new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: summary.map(t => t.name),
+          datasets: [{
+            label: 'คะแนนรวม',
+            data: summary.map(t => t.score),
+            backgroundColor: summary.map(t => t.color),
+            borderWidth: 1
+          }]
+        },
+        options: { responsive: true, plugins: { legend: { display: false } } }
+      });
+    }
+
+    // หน้าที่ 5: หน้าล็อกอินเข้าสู่ระบบ (#login)
+    function renderLogin(target) {
+      target.innerHTML = `
+        <div class="max-w-md mx-auto bg-white p-8 rounded-xl shadow-lg border mt-10">
+          <div class="text-center mb-6">
+            <i class="fa-solid fa-user-shield text-4xl text-blue-600 mb-2"></i>
+            <h2 class="text-2xl font-bold text-slate-800">ระบบจัดการสำหรับเจ้าหน้าที่</h2>
+            <p class="text-sm text-slate-400">กรุณากรอกสิทธิ์เพื่อเข้าทำรายการแก้ไขข้อมูลหลังบ้าน</p>
+          </div>
+          <form id="form-login" onsubmit="authLogin(event)" class="space-y-4">
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">ชื่อผู้ใช้งาน (Username)</label>
+              <input type="text" id="login-username" required class="w-full border p-2.5 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none">
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1">รหัสผ่าน (Password)</label>
+              <input type="password" id="login-password" required class="w-full border p-2.5 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none">
+            </div>
+            <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2.5 rounded-lg transition shadow">ยืนยันตัวตน</button>
+          </form>
+        </div>
+      `;
+    }
+
+    async function authLogin(e) {
+      e.preventDefault();
+      const userStr = document.getElementById('login-username').value;
+      const passStr = document.getElementById('login-password').value;
+      
+      const hashed = await sha256(passStr);
+      try {
+        const res = await postApi('login', { username: userStr, passwordHash: hashed });
+        sessionStorage.setItem('user', JSON.stringify(res));
+        State.user = res;
+        showToast(`ยินดีต้อนรับคุณ ${res.name}`, 'success');
+        setupNavbar();
+        window.location.hash = '#admin';
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    }
+
+    function authLogout() {
+      sessionStorage.removeItem('user');
+      State.user = null;
+      showToast('ออกจากระบบเรียบร้อยแล้ว', 'success');
+      setupNavbar();
+      window.location.hash = '#home';
+    }
+
+    // --- ส่วนของระบบหลังบ้าน (ADMIN PANELS) ---
+
+    function getAdminMenu() {
+      return `
+        <div class="bg-slate-800 text-white p-4 rounded-xl mb-6 grid grid-cols-2 md:grid-cols-7 gap-2 text-center text-xs font-medium shadow-md">
+          <a href="#admin" class="p-2 hover:bg-slate-700 rounded transition"><i class="fa-solid fa-gauge block text-lg mb-1 text-sky-400"></i>ภาพรวม</a>
+          <a href="#admin-sports" class="p-2 hover:bg-slate-700 rounded transition"><i class="fa-solid fa-basketball block text-lg mb-1 text-orange-400"></i>จัดการกีฬา</a>
+          <a href="#admin-teams" class="p-2 hover:bg-slate-700 rounded transition"><i class="fa-solid fa-palette block text-lg mb-1 text-emerald-400"></i>จัดการคณะสี</a>
+          <a href="#admin-schedule" class="p-2 hover:bg-slate-700 rounded transition"><i class="fa-solid fa-calendar-list block text-lg mb-1 text-yellow-400"></i>ตารางการแข่งขัน</a>
+          <a href="#admin-results" class="p-2 hover:bg-slate-700 rounded transition"><i class="fa-solid fa-square-poll-horizontal block text-lg mb-1 text-indigo-400"></i>บันทึกผลการแข่ง</a>
+          <a href="#admin-import" class="p-2 hover:bg-slate-700 rounded transition"><i class="fa-solid fa-file-import block text-lg mb-1 text-purple-400"></i>นำเข้านักกีฬา</a>
+          <a href="#admin-download" class="p-2 hover:bg-slate-700 rounded transition"><i class="fa-solid fa-download block text-lg mb-1 text-pink-400"></i>ดาวน์โหลด/พิมพ์</a>
+        </div>
+      `;
+    }
+
+    // หน้าที่ 6: Admin แดชบอร์ด (#admin)
+    async function renderAdminDashboard(target) {
+      const dash = await fetchApi('getDashboard');
+      target.innerHTML = `
+        ${getAdminMenu()}
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
+          <div class="bg-white p-5 rounded-xl shadow border flex justify-between items-center">
+            <div><span class="text-sm text-slate-400 block font-medium">รายการแข่งขันทั้งหมด</span><span class="text-3xl font-bold text-slate-800">${dash.scheduleCount} รายการ</span></div>
+            <i class="fa-solid fa-list-check text-3xl text-blue-500"></i>
+          </div>
+          <div class="bg-white p-5 rounded-xl shadow border flex justify-between items-center">
+            <div><span class="text-sm text-slate-400 block font-medium">กำลังแข่งขันอยู่ขณะนี้</span><span class="text-3xl font-bold text-amber-600 animate-pulse">${dash.liveCount} รายการ</span></div>
+            <i class="fa-solid fa-bolt text-3xl text-amber-500"></i>
+          </div>
+          <div class="bg-white p-5 rounded-xl shadow border flex justify-between items-center">
+            <div><span class="text-sm text-slate-400 block font-medium">สรุปผลเสร็จสิ้นแล้ว</span><span class="text-3xl font-bold text-emerald-600">${dash.finishedCount} รายการ</span></div>
+            <i class="fa-solid fa-circle-check text-3xl text-emerald-500"></i>
+          </div>
+        </div>
+        <div class="bg-white p-6 rounded-xl shadow border">
+          <h3 class="font-bold text-lg mb-4 text-slate-700 border-b pb-2"><i class="fa-solid fa-bolt mr-2 text-yellow-500"></i>Quick Actions ทำรายการด่วน</h3>
+          <div class="flex flex-wrap gap-3">
+            <a href="#admin-results" class="bg-blue-600 text-white font-semibold text-sm px-4 py-2.5 rounded-lg shadow hover:bg-blue-700 transition"><i class="fa-solid fa-plus mr-1"></i> บันทึกผลการแข่งขันใหม่</a>
+            <a href="#admin-schedule" class="bg-slate-700 text-white font-semibold text-sm px-4 py-2.5 rounded-lg shadow hover:bg-slate-800 transition"><i class="fa-solid fa-calendar-plus mr-1"></i> เพิ่มรอบ/ตารางการแข่งขัน</a>
+          </div>
+        </div>
+      `;
+    }
+
+    // หน้าที่ 7: จัดการกีฬา (#admin-sports)
+    function renderAdminSports(target) {
+      target.innerHTML = `
+        ${getAdminMenu()}
+        <div class="bg-white p-6 rounded-xl shadow border">
+          <div class="flex justify-between items-center mb-4">
+            <h2 class="text-xl font-bold text-slate-800">จัดการประเภทกีฬา</h2>
+            <button onclick="showSportFormModal()" class="bg-emerald-600 hover:bg-emerald-700 text-white font-medium text-sm px-4 py-2 rounded-lg shadow"><i class="fa-solid fa-plus mr-1"></i> เพิ่มประเภทกีฬา</button>
+          </div>
+          <table class="w-full text-left border-collapse text-sm">
+            <thead>
+              <tr class="bg-slate-100 border-b font-bold text-slate-600">
+                <th class="p-3">ID</th>
+                <th class="p-3">ชื่อกีฬา</th>
+                <th class="p-3">ประเภท</th>
+                <th class="p-3">ช่วงชั้น</th>
+                <th class="p-3 text-center">จัดการ</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${State.sports.map(s => `
+                <tr class="border-b">
+                  <td class="p-3 font-mono">${s.id}</td>
+                  <td class="p-3 font-bold text-slate-700">${s.ชื่อกีฬา}</td>
+                  <td class="p-3">${s.ประเภท} (${s.เพศ})</td>
+                  <td class="p-3">${s.ช่วงชั้น}</td>
+                  <td class="p-3 text-center space-x-2">
+                    <button onclick="showSportFormModal(${s.id})" class="text-blue-600 hover:text-blue-800"><i class="fa-solid fa-pen-to-square"></i></button>
+                    <button onclick="deleteSportItem(${s.id})" class="text-rose-600 hover:text-rose-800"><i class="fa-solid fa-trash"></i></button>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      `;
+    }
+
+    function showSportFormModal(id = null) {
+      const sport = id ? State.sports.find(s => s.id == id) : null;
+      let html = `
+        <div class="p-6">
+          <h3 class="text-lg font-bold mb-4">${id ? 'แก้ไขประเภทกีฬา' : 'เพิ่มประเภทกีฬาใหม่'}</h3>
+          <form id="form-sport-submit" onsubmit="submitSportForm(event, ${id})" class="space-y-4">
+            <div>
+              <label class="block text-sm font-medium mb-1">ชื่อกีฬา</label>
+              <input type="text" id="form-sp-name" value="${sport ? sport.ชื่อกีฬา : ''}" required class="w-full border p-2 rounded">
+            </div>
+            <div class="grid grid-cols-2 gap-4">
+              <div>
+                <label class="block text-sm font-medium mb-1">ประเภท</label>
+                <select id="form-sp-type" class="w-full border p-2 rounded">
+                  <option ${sport?.ประเภท === 'เดี่ยว' ? 'selected':''}>เดี่ยว</option>
+                  <option ${sport?.ประเภท === 'ทีม' ? 'selected':''}>ทีม</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-sm font-medium mb-1">เพศ</label>
+                <select id="form-sp-gender" class="w-full border p-2 rounded">
+                  <option ${sport?.เพศ === 'ชาย' ? 'selected':''}>ชาย</option>
+                  <option ${sport?.เพศ === 'หญิง' ? 'selected':''}>หญิง</option>
+                  <option ${sport?.เพศ === 'รวม' ? 'selected':''}>รวม</option>
+                </select>
+              </div>
+            </div>
+            <div>
+              <label class="block text-sm font-medium mb-1">ช่วงชั้น</label>
+              <input type="text" id="form-sp-level" value="${sport ? sport.ช่วงชั้น : 'ม.ต้น'}" class="w-full border p-2 rounded">
+            </div>
+            <div>
+              <label class="block text-sm font-medium mb-1">จำนวนผู้แข่งต่อทีม</label>
+              <input type="number" id="form-sp-players" value="${sport ? sport.จำนวนผู้แข่ง : 1}" class="w-full border p-2 rounded">
+            </div>
+            <div class="flex justify-end space-x-2 pt-4">
+              <button type="button" onclick="closeModal()" class="px-4 py-2 border rounded">ยกเลิก</button>
+              <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded">บันทึกข้อมูล</button>
+            </div>
+          </form>
+        </div>
+      `;
+      openModal(html);
+    }
+
+    async function submitSportForm(e, id) {
+      e.preventDefault();
+      const payload = {
+        ชื่อกีฬา: document.getElementById('form-sp-name').value,
+        ประเภท: document.getElementById('form-sp-type').value,
+        เพศ: document.getElementById('form-sp-gender').value,
+        ช่วงชั้น: document.getElementById('form-sp-level').value,
+        จำนวนผู้แข่ง: document.getElementById('form-sp-players').value
+      };
+      
+      const action = id ? 'updateSport' : 'addSport';
+      await postApi(action, { id: id, data: payload });
+      showToast('บันทึกข้อมูลกีฬาสำเร็จ', 'success');
+      closeModal();
+      await loadInitialData();
+      renderAdminSports(document.getElementById('app'));
+    }
+
+    async function deleteSportItem(id) {
+      if(!confirm('คุณแน่ใจหรือไม่ว่าต้องการลบประเภทกีฬานี้ออกจากระบบ?')) return;
+      await postApi('deleteSport', { id: id });
+      showToast('ลบข้อมูลเรียบร้อยแล้ว', 'success');
+      await loadInitialData();
+      renderAdminSports(document.getElementById('app'));
+    }
+
+    // หน้าที่ 8: จัดการคณะสี (#admin-teams)
+    function renderAdminTeams(target) {
+      target.innerHTML = `
+        ${getAdminMenu()}
+        <div class="bg-white p-6 rounded-xl shadow border">
+          <h2 class="text-xl font-bold text-slate-800 mb-6">จัดการคณะสีในระบบโรงเรียน</h2>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            ${State.teams.map(t => `
+              <div class="border rounded-xl p-5 shadow-sm bg-slate-50 flex items-center justify-between">
+                <div class="flex items-center space-x-4">
+                  <div class="w-12 h-12 rounded-full border shadow-inner" style="background-color: ${t['สีหลัก(hex)']}"></div>
+                  <div>
+                    <h4 class="font-bold text-lg">${t.ชื่อคณะ}</h4>
+                    <p class="text-xs text-slate-400">อาจารย์ที่ปรึกษา: ${t.ครูที่ปรึกษา || '-'}</p>
+                  </div>
+                </div>
+                <button onclick="showTeamEditModal(${t.id})" class="bg-blue-100 hover:bg-blue-200 text-blue-700 px-3 py-1.5 rounded-lg text-sm font-semibold"><i class="fa-solid fa-palette mr-1"></i> แก้ไขสี/ข้อมูล</button>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      `;
+    }
+
+    function showTeamEditModal(id) {
+      const team = State.teams.find(t => t.id == id);
+      let html = `
+        <div class="p-6">
+          <h3 class="text-lg font-bold mb-4">ปรับแต่งโครงสร้างคณะสี: ${team.ชื่อคณะ}</h3>
+          <form onsubmit="submitTeamForm(event, ${id})" class="space-y-4">
+            <div>
+              <label class="block text-sm font-medium mb-1">เลือกสีหลัก (Hex Code)</label>
+              <div class="flex items-center space-x-2">
+                <input type="color" id="form-tm-color" value="${team['สีหลัก(hex)']}" class="w-12 h-10 border p-1 rounded">
+                <input type="text" id="form-tm-color-hex" value="${team['สีหลัก(hex)']}" class="w-full border p-2 rounded font-mono">
+              </div>
+            </div>
+            <div>
+              <label class="block text-sm font-medium mb-1">อาจารย์ที่ปรึกษาคณะสี</label>
+              <input type="text" id="form-tm-advisor" value="${team.ครูที่ปรึกษา || ''}" class="w-full border p-2 rounded">
+            </div>
+            <div class="flex justify-end space-x-2 pt-4">
+              <button type="button" onclick="closeModal()" class="px-4 py-2 border rounded">ยกเลิก</button>
+              <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded">อัปเดต</button>
+            </div>
+          </form>
+        </div>
+      `;
+      openModal(html);
+      // Link real-time dynamic value picker
+      document.getElementById('form-tm-color').oninput = (e) => {
+        document.getElementById('form-tm-color-hex').value = e.target.value.toUpperCase();
+      }
+    }
+
+    async function submitTeamForm(e, id) {
+      e.preventDefault();
+      const payload = {
+        'สีหลัก(hex)': document.getElementById('form-tm-color-hex').value,
+        ครูที่ปรึกษา: document.getElementById('form-tm-advisor').value
+      };
+      await postApi('updateTeam', { id: id, data: payload });
+      showToast('อัปเดตข้อมูลสีเรียบร้อยแล้ว', 'success');
+      closeModal();
+      await loadInitialData();
+      renderAdminTeams(document.getElementById('app'));
+    }
+
+    // หน้าที่ 9: บันทึกผลการแข่งขัน (#admin-results)
+    async function renderAdminResults(target) {
+      showLoading(true);
+      const schedule = await fetchApi('getSchedule');
+      showLoading(false);
+      
+      const activeMatches = schedule.filter(s => s.สถานะ !== 'จบ');
+
+      target.innerHTML = `
+        ${getAdminMenu()}
+        <div class="bg-white p-6 rounded-xl shadow border max-w-2xl mx-auto">
+          <h2 class="text-xl font-bold text-slate-800 mb-4"><i class="fa-solid fa-square-poll-horizontal text-indigo-600 mr-2"></i>บันทึกผลการแข่งขัน (ระบบทีละขั้นตอน)</h2>
+          
+          <div id="result-step-1" class="space-y-4">
+            <p class="text-sm text-slate-400"><strong>ขั้นตอนที่ 1:</strong> เลือกรายการการแข่งขันแมตช์ที่ต้องการบันทึกผลการรับรางวัล</p>
+            <select id="res-select-match" class="w-full border p-3 rounded-lg font-medium text-slate-700">
+              <option value="">-- กรุณาเลือกรายการแมตช์ที่แข่งขันเสร็จสิ้น --</option>
+              ${activeMatches.map(m => {
+                const sp = State.sports.find(s => s.id == m.id_กีฬา);
+                return `<option value="${m.id}">ID #${m.id} | ${sp?.ชื่อกีฬา} [${m.วันที่} ${m.เวลาเริ่ม} น.] ณ ${m.สถานที่}</option>`;
+              }).join('')}
+            </select>
+            <button onclick="goToResultStep2()" class="w-full bg-blue-600 text-white font-bold py-2.5 rounded-lg shadow">ดำเนินการขั้นตอนต่อไป <i class="fa-solid fa-arrow-right ml-1"></i></button>
+          </div>
+
+          <div id="result-step-2" class="hidden space-y-4">
+            </div>
+        </div>
+      `;
+    }
+
+    async function goToResultStep2() {
+      const matchId = document.getElementById('res-select-match').value;
+      if(!matchId) return alert('กรุณาเลือกรายการแข่งก่อน');
+
+      showLoading(true);
+      const match = (await fetchApi('getSchedule')).find(m => m.id == matchId);
+      const athletes = await fetchApi('getAthletes', { sport_id: match.id_กีฬา });
+      showLoading(false);
+
+      const step2 = document.getElementById('result-step-2');
+      document.getElementById('result-step-1').classList.add('hidden');
+      step2.classList.remove('hidden');
+
+      let ranks = [1, 2, 3];
+      step2.innerHTML = `
+        <h3 class="font-bold text-md text-slate-700">ขั้นตอนที่ 2: บันทึกรายชื่อและอันดับคณะสี</h3>
+        <p class="text-xs text-slate-400">กรอกข้อมูลผู้ที่ได้รับเหรียญทอง (อันดับ 1) เหรียญเงิน (อันดับ 2) และเหรียญทองแดง (อันดับ 3)</p>
+        
+        <form id="form-all-results" onsubmit="submitResultsFinal(event, ${matchId})" class="space-y-4">
+          ${ranks.map(r => `
+            <div class="p-4 border rounded-lg bg-slate-50 space-y-3">
+              <span class="font-bold text-sm block text-blue-700">🏆 อันดับที่ ${r} (${r===1?'เหรียญทอง':r===2?'เหรียญเงิน':'เหรียญทองแดง'})</span>
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                  <label class="block text-xs font-medium mb-1">เลือกคณะสี</label>
+                  <select name="team_${r}" required class="w-full border p-2 rounded text-xs">
+                    <option value="">-- เลือกคณะสี --</option>
+                    ${State.teams.map(t => `<option value="${t.id}">${t.nombre || t.ชื่อคณะ}</option>`).join('')}
+                  </select>
+                </div>
+                <div>
+                  <label class="block text-xs font-medium mb-1">สถิติ/เวลา/คะแนนที่ทำได้</label>
+                  <input type="text" name="value_${r}" placeholder="เช่น 10.23 วินาที หรือ 2-0 เซ็ต" class="w-full border p-2 rounded text-xs">
+                </div>
+              </div>
+            </div>
+          `).join('')}
+          <div class="flex justify-between space-x-2 pt-4">
+            <button type="button" onclick="renderAdminResults(document.getElementById('app'))" class="px-4 py-2 border rounded text-sm">ย้อนกลับ</button>
+            <button type="submit" class="px-6 py-2 bg-emerald-600 text-white font-bold rounded text-sm shadow">ยืนยันผลเป็นทางการ & ปิดแมตช์</button>
+          </div>
+        </form>
+      `;
+    }
+
+    async function submitResultsFinal(e, matchId) {
+      e.preventDefault();
+      if(!confirm('เมื่อบันทึกผลสำเร็จ รายการแข่งนี้จะปรับสถานะเป็น "จบ" ทันที ยืนยันข้อมูล?')) return;
+
+      const form = e.target;
+      const dataArr = [
+        { อันดับ: 1, ประเภทเหรียญ: 'ทอง', id_คณะสี: form.team_1.value, ค่า: form.value_1.value },
+        { อันดับ: 2, ประเภทเหรียญ: 'เงิน', id_คณะสี: form.team_2.value, ค่า: form.value_2.value },
+        { อันดับ: 3, ประเภทเหรียญ: 'ทองแดง', id_คณะสี: form.team_3.value, ค่า: form.value_3.value }
+      ];
+
+      await postApi('addResult', { schedule_id: matchId, results: dataArr });
+      showToast('บันทึกผลสรุปคะแนนกีฬาสีสำเร็จเรียบร้อยแล้ว', 'success');
+      window.location.hash = '#admin';
+    }
+
+    // หน้าที่ 10: จัดการตารางการแข่งขัน (#admin-schedule)
+    async function renderAdminSchedule(target) {
+      showLoading(true);
+      const list = await fetchApi('getSchedule');
+      showLoading(false);
+
+      target.innerHTML = `
+        ${getAdminMenu()}
+        <div class="bg-white p-6 rounded-xl shadow border">
+          <div class="flex justify-between items-center mb-4">
+            <h2 class="text-xl font-bold text-slate-800">จัดการตารางแมตช์การแข่งขัน</h2>
+            <button onclick="showScheduleCreateModal()" class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-2 rounded-lg font-medium"><i class="fa-solid fa-plus mr-1"></i> เพิ่มรายการแข่ง</button>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-sm border-collapse">
+              <thead>
+                <tr class="bg-slate-100 border-b">
+                  <th class="p-3">วัน/เวลา</th>
+                  <th class="p-3">กีฬา</th>
+                  <th class="p-3">สถานที่</th>
+                  <th class="p-3">สถานะ</th>
+                  <th class="p-3 text-center">อัปเดตสถานะด่วน</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${list.map(s => {
+                  const sport = State.sports.find(sp => sp.id == s.id_กีฬา);
+                  return `
+                    <tr class="border-b">
+                      <td class="p-3 font-mono text-xs">${s.วันที่}<br>${s.เวลาเริ่ม}น.</td>
+                      <td class="p-3 font-bold">${sport?.ชื่อกีฬา}</td>
+                      <td class="p-3">${s.สถานที่}</td>
+                      <td class="p-3 font-bold text-blue-600">${s.สถานะ}</td>
+                      <td class="p-3 text-center space-x-1">
+                        <button onclick="quickUpdateStatus(${s.id}, 'กำลังแข่ง')" class="bg-amber-500 text-white px-2 py-1 rounded text-xs">กำลังแข่ง</button>
+                        <button onclick="quickUpdateStatus(${s.id}, 'เลื่อน')" class="bg-rose-500 text-white px-2 py-1 rounded text-xs">เลื่อน</button>
+                      </td>
+                    </tr>
+                  `;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    }
+
+    function showScheduleCreateModal() {
+      let html = `
+        <div class="p-6">
+          <h3 class="text-lg font-bold mb-4">เพิ่มรอบตารางการแข่งขันใหม่</h3>
+          <form onsubmit="submitScheduleCreate(event)" class="space-y-4">
+            <div>
+              <label class="block text-sm font-medium mb-1">เลือกประเภทกีฬา</label>
+              <select id="form-sch-sport" required class="w-full border p-2 rounded">
+                ${State.sports.map(s => `<option value="${s.id}">${s.ชื่อกีฬา} (${s.ช่วงชั้น})</option>`).join('')}
+              </select>
+            </div>
+            <div class="grid grid-cols-3 gap-2">
+              <div><label class="text-xs font-medium">วันที่แข่ง</label><input type="date" id="form-sch-date" required class="w-full border p-2 text-sm rounded"></div>
+              <div><label class="text-xs font-medium">เวลาเริ่ม</label><input type="text" id="form-sch-start" placeholder="09:00" class="w-full border p-2 text-sm rounded"></div>
+              <div><label class="text-xs font-medium">เวลาสิ้นสุด</label><input type="text" id="form-sch-end" placeholder="10:30" class="w-full border p-2 text-sm rounded"></div>
+            </div>
+            <div>
+              <label class="block text-sm font-medium mb-1">สถานที่แข่งขัน</label>
+              <input type="text" id="form-sch-venue" required class="w-full border p-2 rounded">
+            </div>
+            <div class="flex justify-end space-x-2 pt-4">
+              <button type="button" onclick="closeModal()" class="px-4 py-2 border rounded">ยกเลิก</button>
+              <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded">เพิ่มลงตาราง</button>
+            </div>
+          </form>
+        </div>
+      `;
+      openModal(html);
+    }
+
+    async function submitScheduleCreate(e) {
+      e.preventDefault();
+      const payload = {
+        id_กีฬา: document.getElementById('form-sch-sport').value,
+        วันที่: document.getElementById('form-sch-date').value,
+        เวลาเริ่ม: document.getElementById('form-sch-start').value,
+        เวลาสิ้นสุด: document.getElementById('form-sch-end').value,
+        สถานที่: document.getElementById('form-sch-venue').value,
+        สถานะ: 'รอ'
+      };
+      await postApi('addSchedule', { data: payload });
+      showToast('เพิ่มข้อมูลตารางแข่งขันแล้ว', 'success');
+      closeModal();
+      renderAdminSchedule(document.getElementById('app'));
+    }
+
+    async function quickUpdateStatus(id, status) {
+      await postApi('updateScheduleStatus', { id: id, status: status });
+      showToast(`เปลี่ยนสถานะรายการแข่งขันเป็น [${status}] แล้ว`, 'success');
+      renderAdminSchedule(document.getElementById('app'));
+    }
+
+    // หน้าที่ 11: นำเข้ารายชื่อนักกีฬาจาก Excel (#admin-import)
+    function renderAdminImport(target) {
+      target.innerHTML = `
+        ${getAdminMenu()}
+        <div class="bg-white p-6 rounded-xl shadow border max-w-2xl mx-auto">
+          <h2 class="text-xl font-bold text-slate-800 mb-2"><i class="fa-solid fa-file-import text-purple-600 mr-2"></i>ระบบนำเข้ารายชื่อนักกีฬาแบบกลุ่ม</h2>
+          <p class="text-sm text-slate-400 mb-4">ดาวน์โหลดไฟล์แม่แบบ กรอกข้อมูลนักเรียน แล้วทำการอัปโหลดระบบจะเชื่อมโยงตารางฐานข้อมูลอัตโนมัติ</p>
+          
+          <div class="flex space-x-4 mb-6">
+            <button onclick="downloadAthleteTemplate()" class="bg-slate-100 border text-slate-700 hover:bg-slate-200 text-sm px-4 py-2 rounded-lg font-medium"><i class="fa-solid fa-file-excel text-emerald-600 mr-1"></i> ดาวน์โหลด Template</button>
+          </div>
+
+          <div class="border-2 border-dashed border-slate-300 rounded-xl p-8 text-center bg-slate-50 relative">
+            <i class="fa-solid fa-cloud-arrow-up text-4xl text-slate-400 mb-2"></i>
+            <p class="text-sm text-slate-600 font-medium">ลากไฟล์มาวางที่นี่ หรือ เลือกไฟล์ .xlsx เพื่อวิเคราะห์ข้อมูล</p>
+            <input type="file" id="upload-excel-file" accept=".xlsx" onchange="parseExcelAthlete(event)" class="absolute inset-0 opacity-0 cursor-pointer">
+          </div>
+
+          <div id="import-preview-area" class="mt-6 hidden">
+            <h4 class="font-bold text-slate-700 mb-2 text-sm">ข้อมูลตัวอย่างพรีวิว 5 แถวแรก</h4>
+            <div class="overflow-x-auto max-h-40 border rounded mb-4" id="table-preview-xlsx"></div>
+            <button onclick="executeFinalImport()" class="w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-2.5 rounded-lg shadow">เริ่มต้นบันทึกนำข้อมูลลงระบบ</button>
+          </div>
+        </div>
+      `;
+    }
+
+    let parsedExcelData = [];
+
+    function downloadAthleteTemplate() {
+      const headers = [["เลขประจำตัว", "ชื่อ", "นามสกุล", "ชั้น/ห้อง", "id_คณะสี", "id_กีฬา", "หมายเหตุ"]];
+      const ws = XLSX.utils.aoa_to_sheet(headers);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "รายชื่อนักกีฬา");
+      XLSX.writeFile(wb, "Template_Athletes.xlsx");
+    }
+
+    function parseExcelAthlete(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = function(evt) {
+        const data = evt.target.result;
+        const workbook = XLSX.read(data, { type: 'binary' });
+        const sheetName = workbook.SheetNames[0];
+        const sheet = workbook.Sheets[sheetName];
+        
+        // แปลงไฟล์เป็น JSON Object Array
+        const json = XLSX.utils.sheet_to_json(sheet);
+        if(json.length === 0) return alert('ไม่พบข้อมูลนักกีฬาในไฟล์');
+
+        parsedExcelData = json.map(r => ({
+          เลขประจำตัว: r['เลขประจำตัว'] || '',
+          ชื่อ: r['ชื่อ'] || '',
+          นามสกุล: r['นามสกุล'] || '',
+          'ชั้น/ห้อง': r['ชั้น/ห้อง'] || '',
+          id_คณะสี: r['id_คณะสี'] || '',
+          id_กีฬา: r['id_กีฬา'] || '',
+          หมายเหตุ: r['หมายเหตุ'] || ''
+        }));
+
+        document.getElementById('import-preview-area').classList.remove('hidden');
+        let tableHtml = `<table class="w-full text-left text-xs border-collapse">`;
+        parsedExcelData.slice(0, 5).forEach(r => {
+          tableHtml += `<tr class="border-b p-1"><td>${r.เลขประจำตัว}</td><td>${r.ชื่อ} ${r.นามสกุล}</td><td>${r.id_คณะสี}</td></tr>`;
+        });
+        tableHtml += `</table>`;
+        document.getElementById('table-preview-xlsx').innerHTML = tableHtml;
+      };
+      reader.readAsBinaryString(file);
+    }
+
+    async function executeFinalImport() {
+      if(parsedExcelData.length === 0) return;
+      const res = await postApi('importAthletes', { data: parsedExcelData });
+      showToast(`นำข้อมูลนักกีฬาจำนวน ${res.imported} รายการ เข้าสู่ฐานข้อมูลคลาวด์สำเร็จ`, 'success');
+      window.location.hash = '#admin';
+    }
+
+    // หน้าที่ 12: หน้าดาวน์โหลดรายงานสรุปผล (.xlsx) (#admin-download)
+    function renderAdminDownload(target) {
+      target.innerHTML = `
+        ${getAdminMenu()}
+        <div class="bg-white p-6 rounded-xl shadow border max-w-xl mx-auto">
+          <h2 class="text-xl font-bold text-slate-800 mb-4"><i class="fa-solid fa-download text-pink-600 mr-2"></i>ศูนย์ส่งออกข้อมูลและรายงานความปลอดภัย</h2>
+          <p class="text-sm text-slate-400 mb-6">ส่งออกข้อมูลจากตาราง Google Sheets บนระบบคลาวด์มาใช้งานในเครื่องคอมพิวเตอร์ของคุณในฟอร์แมต Excel</p>
+          <div class="space-y-3">
+            <button onclick="exportExcelMedals()" class="w-full text-left p-4 bg-slate-50 hover:bg-slate-100 border rounded-xl flex items-center justify-between font-bold text-slate-700 transition">
+              <span><i class="fa-solid fa-medal text-yellow-500 mr-2"></i> 1. ดาวน์โหลดรายงานสรุปเหรียญรางวัลคณะสี (.xlsx)</span>
+              <i class="fa-solid fa-chevron-right text-slate-300"></i>
+            </button>
+            <button onclick="exportExcelSchedulesAll()" class="w-full text-left p-4 bg-slate-50 hover:bg-slate-100 border rounded-xl flex items-center justify-between font-bold text-slate-700 transition">
+              <span><i class="fa-solid fa-calendar-days text-blue-500 mr-2"></i> 2. ดาวน์โหลดตารางแข่งขันทั้งหมด (.xlsx)</span>
+              <i class="fa-solid fa-chevron-right text-slate-300"></i>
+            </button>
+            <a href="#admin-certificate" class="w-full text-left p-4 bg-slate-50 hover:bg-slate-100 border rounded-xl flex items-center justify-between font-bold text-slate-700 transition block">
+              <span><i class="fa-solid fa-print text-purple-500 mr-2"></i> 3. ระบบพิมพ์พิมพ์เกียรติบัตรอิเล็กทรอนิกส์ (A4 PDF)</span>
+              <i class="fa-solid fa-chevron-right text-slate-300"></i>
+            </a>
+          </div>
+        </div>
+      `;
+    }
+
+    async function exportExcelMedals() {
+      showLoading(true);
+      const summary = await fetchApi('getMedalSummary');
+      showLoading(false);
+      
+      const mapped = summary.map(t => ({ "ชื่อคณะสี": t.name, "ทอง": t.gold, "เงิน": t.silver, "ทองแดง": t.bronze, "คะแนนรวมสะสม": t.score }));
+      const ws = XLSX.utils.json_to_sheet(mapped);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "สรุปเหรียญรางวัล");
+      XLSX.writeFile(wb, "Report_Medals_Summary.xlsx");
+    }
+
+    async function exportExcelSchedulesAll() {
+      showLoading(true);
+      const data = await fetchApi('getSchedule');
+      showLoading(false);
+      const ws = XLSX.utils.json_to_sheet(data);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "ตารางแข่ง");
+      XLSX.writeFile(wb, "Report_Schedules.xlsx");
+    }
+
+    // หน้าที่ 13: พิมพ์เกียรติบัตรรางวัลศิษย์เก่า/นักเรียน (#admin-certificate)
+    async function renderAdminCertificate(target) {
+      showLoading(true);
+      const schedule = await fetchApi('getSchedule');
+      showLoading(false);
+      
+      const finishedMatches = schedule.filter(s => s.สถานะ === 'จบ');
+
+      target.innerHTML = `
+        ${getAdminMenu()}
+        <div class="bg-white p-6 rounded-xl shadow border max-w-xl mx-auto">
+          <h2 class="text-xl font-bold text-slate-800 mb-2"><i class="fa-solid fa-print text-purple-600 mr-2"></i>เครื่องมือจัดทำเกียรติบัตรผู้ชนะแบบอัตโนมัติ</h2>
+          <p class="text-sm text-slate-400 mb-4">เลือกรายการการแข่งขันระบบจะทำการจัดทำโครงสร้างเกียรติบัตรขนาด A4 เพื่อเตรียมสั่งพิมพ์ทันที</p>
+          
+          <select id="cert-match-select" class="w-full border p-3 rounded-lg mb-4 font-medium text-slate-700">
+            <option value="">-- เลือกรายการแข่งขันที่มีผลการแข่งขันเสร็จสิ้น --</option>
+            ${finishedMatches.map(m => {
+              const sp = State.sports.find(s => s.id == m.id_กีฬา);
+              return `<option value="${m.id}">ID #${m.id} | ${sp?.ชื่อกีฬา} [จบการแข่งขัน]</option>`;
+            }).join('')}
+          </select>
+          <button onclick="generatePrintCertificates()" class="w-full bg-purple-600 text-white font-bold py-2.5 rounded-lg shadow"><i class="fa-solid fa-wand-magic-sparkles mr-1"></i> ประมวลผลใบเกียรติบัตรพรีวิว</button>
+        </div>
+      `;
+    }
+
+    async function generatePrintCertificates() {
+      const matchId = document.getElementById('cert-match-select').value;
+      if(!matchId) return alert('กรุณาเลือกแมตช์ก่อน');
+
+      showLoading(true);
+      const results = await fetchApi('getResults', { schedule_id: matchId });
+      const match = (await fetchApi('getSchedule')).find(m => m.id == matchId);
+      const sport = State.sports.find(s => s.id == match.id_กีฬา);
+      showLoading(false);
+
+      if(results.length === 0) return alert('ไม่พบผลรางวัลการแข่งขันของรายการนี้');
+
+      let printArea = document.getElementById('print-area');
+      printArea.innerHTML = results.map(r => {
+        const team = State.teams.find(t => t.id == r.id_คณะสี);
+        return `
+          <div class="w-[297mm] h-[210mm] border-8 border-double border-amber-600 bg-amber-50/20 p-20 flex flex-col justify-between text-center items-center mx-auto my-4 bg-white relative shadow-lg" style="page-break-after: always; box-sizing: border-box;">
+            <div class="space-y-4">
+              <i class="fa-solid fa-graduation-cap text-5xl text-amber-600"></i>
+              <h1 class="text-4xl font-extrabold tracking-wide text-slate-800">${CONFIG.SCHOOL_NAME}</h1>
+              <p class="text-lg text-slate-500 font-medium">${CONFIG.EVENT_NAME}</p>
+            </div>
+            
+            <div class="space-y-2 my-6">
+              <span class="text-xl block text-slate-400">เกียรติบัตรฉบับนี้ให้ไว้เพื่อแสดงว่า</span>
+              <h2 class="text-3xl font-bold text-blue-800 my-2">${team?.ชื่อคณะ || 'นักกีฬาสี'}</h2>
+              <p class="text-lg text-slate-600">ได้รับรางวัล <strong class="text-amber-600 text-xl">อันดับที่ ${r.อันดับ} (${r.ประเภทเหรียญ}🥇)</strong></p>
+              <p class="text-md text-slate-500">ในการแข่งขันกีฬาประเภท: <strong>${sport?.ชื่อกีฬา || ''} (${sport?.ช่วงชั้น})</strong></p>
+            </div>
+
+            <div class="w-full flex justify-between items-end px-12 mt-6">
+              <div class="text-center text-sm text-slate-400">
+                <p>ลงชื่อ ............................................</p>
+                <p class="mt-1">ครูผู้จัดการฝ่ายควบคุมเทคนิค</p>
+              </div>
+              <div class="text-center text-sm text-slate-400">
+                <p>ลงชื่อ ............................................</p>
+                <p class="mt-1">ผู้อำนวยการสถานศึกษา</p>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      // ทำการเปิดหน้าต่างพิมพ์ของเบราว์เซอร์
+      window.print();
+    }
+  </script>
+</body>
+</html>
